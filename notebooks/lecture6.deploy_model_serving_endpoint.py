@@ -43,7 +43,7 @@ schema_name = config.schema_name
 # Initialize model serving
 model_serving = ModelServing(
     model_name=f"{catalog_name}.{schema_name}.marvel_character_model_custom", 
-    endpoint_name="marvel-character-model-serving"
+    endpoint_name="marvel-characters-model-serving-dev"
 )
 
 # COMMAND ----------
@@ -125,7 +125,7 @@ def call_endpoint(record):
     """
     Calls the model serving endpoint with a given input record.
     """
-    serving_endpoint = f"{os.environ['DBR_HOST']}/serving-endpoints/marvel-character-model-serving/invocations"    
+    serving_endpoint = f"{os.environ['DBR_HOST']}/serving-endpoints/marvel-characters-model-serving-dev/invocations"    
     print(f"Calling endpoint: {serving_endpoint}")
     
     response = requests.post(

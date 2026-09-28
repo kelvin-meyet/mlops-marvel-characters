@@ -98,7 +98,20 @@ Problems found while running this project locally on Windows, what they caused, 
   - **GitHub → Settings → Environments:** `stage` and `prod`, each with secrets `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET` (that environment's service principal) and variable `DATABRICKS_HOST`. `prod` has **required reviewers**. There is no `dev` environment: no workflow uses one, because dev is deployed from a laptop with a personal login.
   - **`.github/workflows/cd.yml`:** two jobs instead of a matrix. `deploy-stage` runs first; `deploy-prod` has `needs: deploy-stage`, so it is skipped if stage fails and then waits for approval. Only the prod job gets `contents: write`, for the release tag. A `concurrency` group stops two CD runs deploying over each other. The unused step that wrote the secret into `~/.databrickscfg` was removed; the CLI authenticates from the `DATABRICKS_*` environment variables.
 - **Flow:** feature branch → pull request (CI: lint + tests) → merge to `main` → CD deploys stage → approve → CD deploys prod and tags `version.txt`.
-- **Not yet covered:** when the stage/prod `deployment` jobs run and reach `deploy_model`, the service principal needs `CAN_MANAGE` on the endpoint `marvel-character-model-serving`, which `scripts/deploy_model.py` uses for every environment.
+- **Problems on the first run, and fixes:**
+  - The PR was opened against the course's original repo (`marvelousmlops/marvel-characters`) because GitHub defaults a fork's PR base to the parent repo. Closed it and opened it on the fork; `gh repo set-default kelvin-meyet/mlops-marvel-characters` avoids this.
+  - CI did not run on the fork at first: GitHub disables workflows on forks until **Actions → "I understand my workflows, go ahead and enable them"** is clicked.
+  - `deploy-stage` failed with `default auth: cannot configure default credentials ... client_id=***, client_secret=***`. With `--debug` the real reason is `POST /oidc/v1/token → "error": "invalid_client"`: the service principal secrets had been generated with a narrow scope. The CLI requests the `all-apis` scope, so the secrets were regenerated with **All APIs** scope for both `stage_spn` and `prod_spn`, then updated in the GitHub environments.
+  - Result: `deploy-stage` ✓, then approval, then `deploy-prod` ✓, and tag `0.1.0` pushed.
+- **Follow-up:** the stage/prod `deployment` jobs could not safely reach `deploy_model`, because every environment deployed to one endpoint owned by a person. Fixed in entry 8.
+
+## 8. One serving endpoint per environment
+
+- **Problem:** `scripts/deploy_model.py` built `marvel-characters-model-serving-{env}` and then overwrote it with the fixed name `marvel-character-model-serving`, so dev, stage and prod all deployed to the same endpoint.
+- **Error / risk:** whichever job ran last decided what was served (a stage or dev model could replace the prod one). The endpoint was owned by a person, so the prod job, running as `prod_spn`, would fail at `deploy_model` with a permission error unless given `CAN_MANAGE` on it.
+- **Fix:** removed the override, so each environment uses its own endpoint: `marvel-characters-model-serving-dev`, `-stage`, `-prod`. `ModelServing.deploy_or_update_serving_endpoint()` creates the endpoint on the first run, and the identity that creates it (you in dev, `stage_spn` / `prod_spn` via CD) owns it, so no `CAN_MANAGE` grant is needed. `notebooks/lecture6.deploy_model_serving_endpoint.py` now targets `-dev`. `version.txt` bumped to `0.1.1`.
+- **After deploying:** the old shared endpoint `marvel-character-model-serving` is no longer updated by any job; delete it once `-dev` exists.
+- **Still open:** `ModelServing` does not enable inference tables when it creates an endpoint, so new endpoints do not log requests to `custom_model_payload`, and the monitoring job has no data for them.
 
 ## Local environment notes (Windows)
 
