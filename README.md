@@ -103,6 +103,7 @@ Problems found while running this project locally on Windows, what they caused, 
   - CI did not run on the fork at first: GitHub disables workflows on forks until **Actions → "I understand my workflows, go ahead and enable them"** is clicked.
   - `deploy-stage` failed with `default auth: cannot configure default credentials ... client_id=***, client_secret=***`. With `--debug` the real reason is `POST /oidc/v1/token → "error": "invalid_client"`: the service principal secrets had been generated with a narrow scope. The CLI requests the `all-apis` scope, so the secrets were regenerated with **All APIs** scope for both `stage_spn` and `prod_spn`, then updated in the GitHub environments.
   - Result: `deploy-stage` ✓, then approval, then `deploy-prod` ✓, and tag `0.1.0` pushed.
+  - While fixing the secret scopes, `stage_spn` and `prod_spn` were **recreated**, which gives them new Application IDs. Unity Catalog grants belong to the old IDs, so the new service principals had **no data access**; CD still passed (it only deploys), but the stage/prod jobs would have failed on their first task. Fixed by granting the same privileges to the new IDs and removing the stale grants. **Whenever a service principal is recreated, re-apply its grants** (`databricks grants get catalog mlops_stage` shows who has access).
 - **Follow-up:** the stage/prod `deployment` jobs could not safely reach `deploy_model`, because every environment deployed to one endpoint owned by a person. Fixed in entry 8.
 
 ## 8. One serving endpoint per environment
@@ -124,6 +125,15 @@ Problems found while running this project locally on Windows, what they caused, 
   - Pipeline: `preprocessing → train_model → model_updated? → endpoint_enabled? → deploy_model`.
 - **Trade-off:** stage still proves preprocessing, training, the model comparison and registration work as `stage_spn` on `mlops_stage` (where most bugs show up), but no longer tests serving; prod is now the first place serving is exercised outside dev. On a paid workspace, delete the `deploy_endpoint: "false"` line and stage gets its own endpoint again.
 - `version.txt` bumped to `0.1.2`.
+
+## 10. First run in a fresh environment crashed at `train_model`
+
+- **Problem:** `BasicModel.model_improved()` compares the new model with the registered `latest-model`, but in a brand-new environment (the first stage run, and later the first prod run) no model is registered yet.
+- **Error:** the stage job's `train_model` task failed (and its retry too), skipping everything after it:
+  `RestException: RESOURCE_DOES_NOT_EXIST: Routine or Model 'mlops_stage.marvel_characters.marvel_character_model_basic' does not exist.`
+  `preprocessing` succeeded as `stage_spn`, which confirmed the re-applied data permissions work.
+- **Fix:** `src/marvel_characters/models/basic_model.py`: if looking up `latest-model` fails with `RESOURCE_DOES_NOT_EXIST`, `model_improved()` returns `True` (nothing to beat, so the first model is registered). Any other error (e.g. `PERMISSION_DENIED`) still fails the job.
+- **Tests:** new `tests/marvel_characters/test_basic_model.py` covers both cases; the first test fails on the old code. It stubs the `delta` module, which exists only on Databricks. `version.txt` bumped to `0.1.3`.
 
 ## Local environment notes (Windows)
 
