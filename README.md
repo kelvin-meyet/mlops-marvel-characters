@@ -112,6 +112,18 @@ Problems found while running this project locally on Windows, what they caused, 
 - **Fix:** removed the override, so each environment uses its own endpoint: `marvel-characters-model-serving-dev`, `-stage`, `-prod`. `ModelServing.deploy_or_update_serving_endpoint()` creates the endpoint on the first run, and the identity that creates it (you in dev, `stage_spn` / `prod_spn` via CD) owns it, so no `CAN_MANAGE` grant is needed. `notebooks/lecture6.deploy_model_serving_endpoint.py` now targets `-dev`. `version.txt` bumped to `0.1.1`.
 - **After deploying:** the old shared endpoint `marvel-character-model-serving` is no longer updated by any job; delete it once `-dev` exists.
 - **Still open:** `ModelServing` does not enable inference tables when it creates an endpoint, so new endpoints do not log requests to `custom_model_payload`, and the monitoring job has no data for them.
+- **Problem found on the first dev run (free workspace limit):** the dev job's `deploy_model` task failed twice with `TimeoutError: Timed out after 0:05:00` in `ModelServing.deploy_or_update_serving_endpoint()` → `serving_endpoints.create`. Sending the same request directly showed the real response: `429 RESOURCE_EXHAUSTED: "You've hit the limit for endpoints for free usage."` (`currentUsage: 2, maxLimit: 2, limitReason: COMMUNITY_EDITION`). The SDK treats 429 as retryable, so it retried silently for 5 minutes and hid the message. This workspace allows **at most 2 serving endpoints**, fewer than dev + stage + prod need. **Fix for dev:** deleted the two old endpoints (`marvel-character-model-serving`, `marvel-characters-ab-testing`; registered models are unaffected) and re-ran the dev job: all tasks succeeded and `marvel-characters-model-serving-dev` (created by the job, serving `marvel_character_model_custom` v7) became `READY` in about 8 minutes and answered a test request. With one slot left, prod can have an endpoint but stage cannot.
+
+## 9. Per-environment endpoint switch (`deploy_endpoint`): stage skips the endpoint
+
+- **Problem:** the free workspace allows only 2 serving endpoints (entry 8), but dev, stage and prod each tried to create their own. Whichever of stage/prod ran after the other two would fail at `deploy_model` with the hidden 429 timeout.
+- **Fix, in simple terms:** a yes/no setting per environment, "should this environment create a serving endpoint?" (dev: yes, stage: **no**, prod: yes). The job checks it right before `deploy_model`; when it is "no", `deploy_model` is **skipped** and the run still succeeds. The code is identical in every environment; only the setting differs.
+- **How it is wired:**
+  - `databricks.yml`: bundle variable `deploy_endpoint` (default `"true"`); target `stage` sets `deploy_endpoint: "false"`.
+  - `resources/model_deployment.yml`: new `condition_task` `endpoint_enabled` (`${var.deploy_endpoint}` == `"true"`) after `model_updated`; `deploy_model` depends on its `true` outcome.
+  - Pipeline: `preprocessing → train_model → model_updated? → endpoint_enabled? → deploy_model`.
+- **Trade-off:** stage still proves preprocessing, training, the model comparison and registration work as `stage_spn` on `mlops_stage` (where most bugs show up), but no longer tests serving; prod is now the first place serving is exercised outside dev. On a paid workspace, delete the `deploy_endpoint: "false"` line and stage gets its own endpoint again.
+- `version.txt` bumped to `0.1.2`.
 
 ## Local environment notes (Windows)
 
@@ -123,3 +135,12 @@ Problems found while running this project locally on Windows, what they caused, 
 - **Close notebooks before `uv sync`.** A running Jupyter kernel locks `debugpy` files; the sync then stops halfway with `Access is denied (os error 5)` and can leave `ipykernel` uninstalled. Close the kernel and re-run `uv sync --extra dev`.
 - **Keep the Databricks CLI current, and installed only once.** An old Chocolatey install (v0.240.0) sat ahead of the winget install (v1.18.0) on `PATH`. `databricks bundle validate`/`deploy` download Terraform and verify it with a HashiCorp signing key built into the CLI; the key in v0.240.0 has expired, so they failed with `Error: error downloading Terraform: unable to verify checksums signature: openpgp: key expired`. Fixed by `choco uninstall databricks-cli` (admin PowerShell); check with `databricks --version`. CD had the same exposure: `.github/workflows/cd.yml` pinned `databricks/setup-cli` and the CLI to v0.246.0, so both were bumped to v1.18.0 (action pinned by commit SHA `6a2e75f`).
 - **Use a PowerShell terminal in VS Code.** The Databricks extension's "Run as file with Databricks Connect" sends PowerShell syntax (`& "...python.exe" ...`); in Git Bash it fails with `syntax error near unexpected token '&'`.
+
+# Roadmap / future to-dos
+
+Planned work, not started yet:
+
+1. **End-user app.** Build a small web app that calls the model (a UI with a form for the 10 features that shows "alive"/"dead"), and deploy it on **Render**. Decide between a FastAPI backend + simple frontend, or an all-Python UI (Streamlit, Gradio or Dash). The app would call the Databricks serving endpoint with a token stored as a Render secret, not in code.
+2. **Hyperparameter tuning.** The LightGBM parameters are fixed in `project_config_marvel.yml`; there is no tuning. Add a tuning step (e.g. Optuna, logged to MLflow) and possibly revisit the dataset / features.
+3. **Beginner template.** A barebones, easy-to-follow template in a separate folder that a novice can copy for their own end-to-end project (data → training → MLflow registry → serving → CI/CD), with the lessons from this log built in.
+4. **Offline serving check in stage.** Stage skips the endpoint (entry 9), so add a `validate_model` task there that loads the newly registered model with `mlflow.models.predict(...)` in a fresh, isolated environment on Linux (roughly what the serving container does). This would catch serving-only bugs like the Windows artifact path (entry 2) without using an endpoint slot.
