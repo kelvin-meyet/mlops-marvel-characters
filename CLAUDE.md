@@ -9,9 +9,8 @@ End-to-end MLOps course project on Databricks (Marvelous MLOps). A LightGBM clas
 ## Environment
 
 - Target runtime is **Databricks serverless environment version 3** (`client: "3"` in `resources/*.yml`), which pairs with Python 3.12 and `databricks-connect` 16.x. The exact pins in `pyproject.toml` (numpy 1.26.4, pyarrow 17, etc.) are chosen to match it.
-- Do not accept `databricks environments setup-local` / VS Code extension changes that target a newer environment (e.g. env 5): they inject a `[tool.uv] constraint-dependencies` block and `databricks-connect~=18` that conflict with the pins and make `uv lock` unsatisfiable. Keep dependencies aligned with env 3.
+- Do not accept `databricks environments setup-local` / VS Code extension changes that target a newer environment (e.g. env 5): they inject a `[tool.uv] constraint-dependencies` block and `databricks-connect~=18` that conflict with the pins and make `uv lock` unsatisfiable. Keep dependencies aligned with env 3. Also reject a `[dependency-groups] dev` block it may add: uv installs that group on every sync (including CI's `--extra test`), which puts `databricks-connect` next to `pyspark` and breaks test collection.
 - Local dev is on Windows. `.venv` holds only the `dev` extra: never install the `test` extra into it (`pyspark` and `databricks-connect` conflict, and `uv sync --extra test` drops `dev`); run tests with `uv run --isolated --extra test pytest -m "not ci_exclude"`. A running notebook kernel locks `.venv` files, so `uv sync` fails until it is closed.
-- Profiles: the workspace is `dbc-07d12638-ef42` (also in `.env` as `PROFILE`). `DEFAULT` in `~/.databrickscfg` is empty and `dev-databricks` is a different workspace, so pass the profile explicitly to `WorkspaceClient(...)` / `DatabricksSession` when running locally.
 
 ## Commands
 
