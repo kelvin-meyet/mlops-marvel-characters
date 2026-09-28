@@ -77,8 +77,8 @@ class BasicModel:
     def prepare_features(self) -> None:
         """Encode categorical features and define a preprocessing pipeline.
 
-        Creates a ColumnTransformer for one-hot encoding categorical features while passing through numerical
-        features. Constructs a pipeline combining preprocessing and LightGBM classification model.
+        Creates a ColumnTransformer that encodes categorical features as integer category codes while passing
+        through numerical features. Constructs a pipeline combining preprocessing and LightGBM classification model.
         """
         logger.info("🔄 Defining preprocessing pipeline...")
 
@@ -93,7 +93,7 @@ class BasicModel:
                 self.cat_features = cat_features
                 self.cat_maps_ = {}
 
-            def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> None:
+            def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> "CatToIntTransformer":
                 """Fit the transformer to the DataFrame X."""
                 self.fit_transform(X)
                 return self
@@ -119,7 +119,7 @@ class BasicModel:
             transformers=[("cat", CatToIntTransformer(self.cat_features), self.cat_features)], remainder="passthrough"
         )
         self.pipeline = Pipeline(
-            steps=[("preprocessor", preprocessor), ("regressor", LGBMClassifier(**self.parameters))]
+            steps=[("preprocessor", preprocessor), ("classifier", LGBMClassifier(**self.parameters))]
         )
         logger.info("✅ Preprocessing pipeline defined.")
 
