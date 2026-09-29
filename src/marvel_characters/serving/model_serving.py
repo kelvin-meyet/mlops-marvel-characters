@@ -2,10 +2,10 @@
 
 import mlflow
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.serving import (
-    EndpointCoreConfigInput,
-    ServedEntityInput,
-)
+from databricks.sdk.service.serving import ServedEntityInput
+
+# Inference table <catalog>.<schema>.custom_model_payload, read by monitoring.create_or_refresh_monitoring
+INFERENCE_TABLE_PREFIX = "custom_model"
 
 
 class ModelServing:
@@ -31,6 +31,25 @@ class ModelServing:
         print(f"Latest model version: {latest_version}")
         return latest_version
 
+    def telemetry_config(self) -> dict:
+        """Endpoint telemetry that logs requests/responses to <catalog>.<schema>.custom_model_payload.
+
+        The payload table is a view over the telemetry logs table, both next to the served model.
+        The SDK version pinned for serverless env 3 has no telemetry fields, so this is the REST API body.
+
+        :return: telemetry_config section of the serving endpoint create request
+        """
+        catalog_name, schema_name, _ = self.model_name.split(".")
+        prefix = f"{catalog_name}.{schema_name}.{INFERENCE_TABLE_PREFIX}"
+        return {
+            "table_names": {
+                "logs_table": f"{prefix}_otel_logs",
+                "metrics_table": f"{prefix}_otel_metrics",
+                "traces_table": f"{prefix}_otel_spans",
+            },
+            "inference_table_config": {"sampling_fraction": 1.0},
+        }
+
     def deploy_or_update_serving_endpoint(
         self, version: str = "latest", workload_size: str = "Small", scale_to_zero: bool = True
     ) -> None:
@@ -53,11 +72,22 @@ class ModelServing:
         ]
 
         if not endpoint_exists:
-            self.workspace.serving_endpoints.create(
-                name=self.endpoint_name,
-                config=EndpointCoreConfigInput(
-                    served_entities=served_entities,
-                ),
+            # Telemetry must be set when the endpoint is created: added to an existing endpoint it is accepted
+            # but never delivers any rows (and AI Gateway inference tables are rejected for this endpoint type).
+            self.workspace.api_client.do(
+                "POST",
+                "/api/2.0/serving-endpoints",
+                body={
+                    "name": self.endpoint_name,
+                    "config": {"served_entities": [entity.as_dict() for entity in served_entities]},
+                    "telemetry_config": self.telemetry_config(),
+                },
             )
         else:
+            endpoint = self.workspace.api_client.do("GET", f"/api/2.0/serving-endpoints/{self.endpoint_name}")
+            if "telemetry_config" not in endpoint:
+                print(
+                    f"WARNING: endpoint {self.endpoint_name} has no inference-table logging, so monitoring gets "
+                    "no data. Logging can only be set at creation: delete the endpoint and rerun this deployment."
+                )
             self.workspace.serving_endpoints.update_config(name=self.endpoint_name, served_entities=served_entities)
