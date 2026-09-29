@@ -117,3 +117,5 @@ accuracy = (comparison["actual"] == comparison["prediction"]).mean()
 
 print(comparison[["Universe", "Gender", "Origin", "actual", "prediction"]].to_string(index=False))
 print(f"\nMatches on these {N_ROWS} rows: {accuracy:.0%}")
+
+# COMMAND ----------

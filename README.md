@@ -27,6 +27,24 @@ It is used to build classification and feature engineering models for various ML
 - `04.post_commit_status.py`: Posts status updates for Marvel integration tests to GitHub.
 - `05.refresh_monitor.py`: Refreshes monitoring tables and dashboards for Marvel model serving.
 
+# Monitoring
+
+Each environment's serving endpoint logs every request, and the `marvel-characters-monitor-update` job turns those logs into a Lakehouse monitor with a dashboard:
+
+```text
+serving endpoint (telemetry on, set at creation)
+  → custom_model_payload         one row per request (request + response JSON)
+  → model_monitoring             one row per scored character: 10 features + prediction (1 = alive, 0 = dead)
+  → Lakehouse monitor            5-minute windows; drift vs the previous window and vs model_monitoring_baseline (train_set)
+  → dashboard                    profile metrics (counts, nulls, distributions) and drift per feature
+```
+
+To try it, run `notebooks/lecture10.marvel_create_monitoring_table.py`: it sends traffic, creates or refreshes the monitor, and has a step-by-step drift test. Setup details and pitfalls are in fix entries 12 and 13.
+
+**Drift detection on dev.** The drift test sent 100 requests with every character set to `Universe = Earth-1610`, `Height = 250` and `Weight = 200`. For that window (02:15 UTC) the dashboard flags numerical drift on `Height` and `Weight` (KS test) and categorical drift on `Universe` (chi-squared test). `timestamp_ms` is also listed, because timestamps always move forward between windows; it is not a model feature. The quantile-drift chart on the right shows "Unable to render visualization" in this workspace; the tables next to it hold the same information.
+
+![Dev monitoring dashboard showing drift on Height, Weight and Universe](docs/images/monitoring-dev-drift.png)
+
 # Fixes and changes log
 
 Problems found while running this project locally on Windows, what they caused, and how they were fixed.
