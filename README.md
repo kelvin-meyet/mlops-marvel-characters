@@ -2,7 +2,7 @@
 Marvelous MLOps Free End-to-end MLOps with Databricks Course
 
 ## Set up your environment
-In this course, we use Databricks serverless [version 3](https://docs.databricks.com/aws/en/release-notes/serverless/environment-version/three)
+In this project, we use Databricks serverless [version 3](https://docs.databricks.com/aws/en/release-notes/serverless/environment-version/three)
 
 In our examples, we use UV. Check out the documentation on how to install it: https://docs.astral.sh/uv/getting-started/installation/
 
@@ -12,9 +12,8 @@ To create a new environment and create a lockfile, run:
 uv sync --extra dev
 ```
 
-
-
 # Data
+
 Using the [**Marvel Characters Dataset**](https://www.kaggle.com/datasets/mohitbansal31s/marvel-characters?resource=download) from Kaggle.
 
 This dataset contains detailed information about Marvel characters (e.g., name, powers, physical attributes, alignment, etc.).
@@ -37,12 +36,15 @@ Problems found while running this project locally on Windows, what they caused, 
 - **Problem:** the notebooks were written for the Databricks workspace and create Spark with `SparkSession.builder.getOrCreate()`. Run locally from VS Code, there is no Spark cluster behind that call, so the notebooks could not read the Unity Catalog tables (`train_set`, `test_set`).
 - **Error:** the Spark cells did not run locally (no session to the workspace).
 - **Fix:** switched to Databricks Connect, which runs the Spark code on the workspace's serverless compute:
+
   ```python
   from databricks.connect import DatabricksSession
 
   spark = DatabricksSession.builder.profile("dbc-07d12638-ef42").serverless(True).getOrCreate()
   ```
+
   Applied in `lecture2.marvel_data_preprocessing.py`, both `lecture4.*` notebooks and `lecture6.ab_testing.py`. `databricks-connect` 16.x (the `dev` extra) matches serverless environment 3.
+
 - **Follow-up bug:** the new import in `lecture4.train_register_custom_model.py` was written as `from Databricks.connect import ...`. Python package names are case-sensitive, so it failed with `ModuleNotFoundError: No module named 'Databricks'`. Fixed to lowercase `databricks`.
 - **Not yet converted:** `lecture6.deploy_model_serving_endpoint.py` and the first part of `lecture10.marvel_create_monitoring_table.py` still use `SparkSession`.
 
@@ -59,12 +61,12 @@ Problems found while running this project locally on Windows, what they caused, 
 
 ## 3. A/B testing notebook (`notebooks/lecture6.ab_testing.py`)
 
-| Problem | Error / effect | Fix |
-|---|---|---|
-| Model B's "different" parameters were identical to the config values used by model A | The A/B test compared a model with itself | Model B now uses `learning_rate=0.05, n_estimators=300, max_depth=3` |
-| The inline A/B wrapper had the same Windows path bug as #2 | `OSError: No such file or directory: '/model/artifacts\...'` on the endpoint | `.replace("\\", "/")` on both artifact paths in `load_context`. The wrapper is defined in the notebook, so the fix is pickled with the model; no wheel rebuild needed |
-| The endpoint was called with a token created at the top of the notebook with `lifetime_seconds=1200` | Training plus endpoint start-up took longer than 20 minutes: `403 {"error_code":403,"message":"Invalid access token."}` | `call_endpoint` uses `w.config.host` and `w.config.authenticate()`, which returns a fresh auth header on every call |
-| `WorkspaceClient()` had no profile; the local `DEFAULT` profile is empty and `dev-databricks` points at another workspace | The client could resolve to the wrong workspace, or fail with `cannot configure default credentials` | `WorkspaceClient(profile="dbc-07d12638-ef42")`, the same workspace as the Spark session; the endpoint-creation cell reuses that client |
+| Problem                                                                                                                   | Error / effect                                                                                                          | Fix                                                                                                                                                                   |
+| ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Model B's "different" parameters were identical to the config values used by model A                                      | The A/B test compared a model with itself                                                                               | Model B now uses `learning_rate=0.05, n_estimators=300, max_depth=3`                                                                                                  |
+| The inline A/B wrapper had the same Windows path bug as #2                                                                | `OSError: No such file or directory: '/model/artifacts\...'` on the endpoint                                            | `.replace("\\", "/")` on both artifact paths in `load_context`. The wrapper is defined in the notebook, so the fix is pickled with the model; no wheel rebuild needed |
+| The endpoint was called with a token created at the top of the notebook with `lifetime_seconds=1200`                      | Training plus endpoint start-up took longer than 20 minutes: `403 {"error_code":403,"message":"Invalid access token."}` | `call_endpoint` uses `w.config.host` and `w.config.authenticate()`, which returns a fresh auth header on every call                                                   |
+| `WorkspaceClient()` had no profile; the local `DEFAULT` profile is empty and `dev-databricks` points at another workspace | The client could resolve to the wrong workspace, or fail with `cannot configure default credentials`                    | `WorkspaceClient(profile="dbc-07d12638-ef42")`, the same workspace as the Spark session; the endpoint-creation cell reuses that client                                |
 
 ## 4. Environment names: `acc`/`prd` to `stage`/`prod`
 
@@ -112,7 +114,7 @@ Problems found while running this project locally on Windows, what they caused, 
 - **Error / risk:** whichever job ran last decided what was served (a stage or dev model could replace the prod one). The endpoint was owned by a person, so the prod job, running as `prod_spn`, would fail at `deploy_model` with a permission error unless given `CAN_MANAGE` on it.
 - **Fix:** removed the override, so each environment uses its own endpoint: `marvel-characters-model-serving-dev`, `-stage`, `-prod`. `ModelServing.deploy_or_update_serving_endpoint()` creates the endpoint on the first run, and the identity that creates it (you in dev, `stage_spn` / `prod_spn` via CD) owns it, so no `CAN_MANAGE` grant is needed. `notebooks/lecture6.deploy_model_serving_endpoint.py` now targets `-dev`. `version.txt` bumped to `0.1.1`.
 - **After deploying:** the old shared endpoint `marvel-character-model-serving` is no longer updated by any job; delete it once `-dev` exists.
-- **Still open:** `ModelServing` does not enable inference tables when it creates an endpoint, so new endpoints do not log requests to `custom_model_payload`, and the monitoring job has no data for them.
+- **Follow-up (fixed in entry 12):** `ModelServing` did not enable inference tables when it created an endpoint, so new endpoints did not log requests to `custom_model_payload`.
 - **Problem found on the first dev run (free workspace limit):** the dev job's `deploy_model` task failed twice with `TimeoutError: Timed out after 0:05:00` in `ModelServing.deploy_or_update_serving_endpoint()` → `serving_endpoints.create`. Sending the same request directly showed the real response: `429 RESOURCE_EXHAUSTED: "You've hit the limit for endpoints for free usage."` (`currentUsage: 2, maxLimit: 2, limitReason: COMMUNITY_EDITION`). The SDK treats 429 as retryable, so it retried silently for 5 minutes and hid the message. This workspace allows **at most 2 serving endpoints**, fewer than dev + stage + prod need. **Fix for dev:** deleted the two old endpoints (`marvel-character-model-serving`, `marvel-characters-ab-testing`; registered models are unaffected) and re-ran the dev job: all tasks succeeded and `marvel-characters-model-serving-dev` (created by the job, serving `marvel_character_model_custom` v7) became `READY` in about 8 minutes and answered a test request. With one slot left, prod can have an endpoint but stage cannot.
 
 ## 9. Per-environment endpoint switch (`deploy_endpoint`): stage skips the endpoint
@@ -141,6 +143,30 @@ Problems found while running this project locally on Windows, what they caused, 
 - **What it does:** shows the endpoint's status and served model version, sends 3 hand-made characters, then sends 20 real test-set rows and compares predictions with the true `Alive` label. `ENDPOINT_NAME` at the top switches endpoints (e.g. `-dev`). Works locally (profile) and in the workspace; authenticates with `w.config.authenticate()` on every call (see entry 3).
 - **Problem hit while building it:** reading `mlops_prod.marvel_characters.test_set` as a person failed with `[INSUFFICIENT_PERMISSIONS] User does not have SELECT on Table 'mlops_prod.marvel_characters.test_set'`. The prod tables are created and owned by `prod_spn`, and people have no read access to prod data; that is the intended lock-down, not a bug.
 - **Fix:** the notebook reads sample rows from **dev's** `test_set` (`DATA_ENV = "dev"`), which is built from the same CSV with the same random split, and sends them to the **prod** endpoint. If people ever need to read prod data, grant `SELECT` on the prod schema to a named group deliberately rather than widening the service principal.
+
+## 12. Monitoring had no data, and could not read this model's predictions
+
+- **Problems:** five, all blocking or corrupting the `marvel-characters-monitor-update` job.
+  1. `ModelServing` created endpoints **without inference-table logging**, so `custom_model_payload` never existed (the only payload table left was `marvel-character-model-serving_payload` from the deleted shared endpoint, with a different name).
+  2. `monitoring.py` expected responses like `{"predictions": [1, 0]}`, but the custom model answers `{"predictions": {"Survival prediction": ["alive", "dead"]}}`, so every prediction would have parsed as empty.
+  3. For a request with several characters, every character got the **first** character's prediction (`predictions[0]`).
+  4. Every run appended the **whole** payload table to `model_monitoring` again, so each rerun duplicated all earlier rows.
+  5. Drift had no baseline, so it only compared one 5-minute window with the previous one, and an empty payload table made the job "succeed" without monitoring anything.
+- **Errors:**
+  - The monitoring job first failed with a table-not-found error for `custom_model_payload`.
+  - Turning on AI Gateway inference tables (`put-ai-gateway`) failed with `Inference table is not currently supported for this endpoint type in this workspace.`
+  - Adding endpoint telemetry to the existing dev endpoint (`patch-telemetry-config`) was accepted, but no rows ever arrived: 100 requests, 20+ minutes, all `custom_model_otel_*` tables empty (not even server logs). The old endpoint's tables, set up at creation, got each row within about 3 seconds.
+- **Fix:**
+  - `src/marvel_characters/serving/model_serving.py`: new endpoints are created with **endpoint telemetry** (`telemetry_config`), logging to `<catalog>.<schema>.custom_model_otel_*` with the `custom_model_payload` view on top. It goes through the REST API, because the SDK pinned for env 3 (0.55) has no telemetry fields. Logging only works when set at creation, so for an existing endpoint without it the code prints a warning instead of trying to patch it.
+  - `src/marvel_characters/monitoring.py`:
+    - `parse_inference_table()` reads the custom model's response format and pairs each record with its own prediction (`posexplode`), mapping `alive` → 1 and `dead` → 0.
+    - `select_new_requests()` appends only requests not yet in `model_monitoring` (anti-join on `databricks_request_id`), so reruns are safe.
+    - `build_baseline()` writes `model_monitoring_baseline` from `train_set`, with the monitoring table's column types (`Teams`/`Magic`/`Mutant` are strings there). The monitor requires a `prediction` column in the baseline (`Column prediction referenced in analysis_config.prediction_col cannot be found`), so the true label `Alive` is used for it: prediction drift then compares served predictions with the training data's alive/dead split (about 75% alive). The monitor is created with it, and existing monitors get it added, so drift is also measured against the training data.
+    - An empty `custom_model_payload` now fails the job with a message pointing at the endpoint's logging.
+  - Tests: `test_monitoring.py` (parser, new-request selection, baseline columns) runs on a local Spark, with data built from Spark literals because on Windows local PySpark crashes when converting Python objects (`Python worker exited unexpectedly (crashed)`). `test_model_serving.py` checks that new endpoints are created with telemetry.
+  - `notebooks/lecture10...`: connects with the CLI profile, sends traffic to the per-env endpoint with fresh auth headers, and has a step-by-step **drift test** that sends a skewed batch and prints the drift per feature. Also the import typo `databriccks` → `databricks`, and monitor granularity `5 minutes` for quicker feedback. `version.txt` bumped to `0.1.5`.
+- **Verified on dev:** the dev endpoint was deleted and recreated with telemetry. Requests showed up in `custom_model_payload` within seconds, 101 requests → 101 rows in `model_monitoring`, the monitor refreshed, and the skewed batch showed drift in `Universe`, `Height` and `Weight`.
+- **To get monitoring on an existing endpoint (e.g. prod):** delete the endpoint (`databricks serving-endpoints delete marvel-characters-model-serving-<env> --profile <PROFILE>`), then rerun the `deployment` job so `deploy_model` recreates it with logging. Note `deploy_model` only runs when training produces a better model. Otherwise, recreate it with the same model version by hand, using the REST call in `ModelServing`. Then send traffic and run `databricks bundle run marvel-characters-monitor-update`.
 
 ## Local environment notes (Windows)
 
