@@ -166,7 +166,19 @@ Problems found while running this project locally on Windows, what they caused, 
   - Tests: `test_monitoring.py` (parser, new-request selection, baseline columns) runs on a local Spark, with data built from Spark literals because on Windows local PySpark crashes when converting Python objects (`Python worker exited unexpectedly (crashed)`). `test_model_serving.py` checks that new endpoints are created with telemetry.
   - `notebooks/lecture10...`: connects with the CLI profile, sends traffic to the per-env endpoint with fresh auth headers, and has a step-by-step **drift test** that sends a skewed batch and prints the drift per feature. Also the import typo `databriccks` → `databricks`, and monitor granularity `5 minutes` for quicker feedback. `version.txt` bumped to `0.1.5`.
 - **Verified on dev:** the dev endpoint was deleted and recreated with telemetry. Requests showed up in `custom_model_payload` within seconds, 101 requests → 101 rows in `model_monitoring`, the monitor refreshed, and the skewed batch showed drift in `Universe`, `Height` and `Weight`.
-- **To get monitoring on an existing endpoint (e.g. prod):** delete the endpoint (`databricks serving-endpoints delete marvel-characters-model-serving-<env> --profile <PROFILE>`), then rerun the `deployment` job so `deploy_model` recreates it with logging. Note `deploy_model` only runs when training produces a better model. Otherwise, recreate it with the same model version by hand, using the REST call in `ModelServing`. Then send traffic and run `databricks bundle run marvel-characters-monitor-update`.
+- **To get monitoring on an existing endpoint:** delete it and recreate it with telemetry **as the identity that owns it** (the job's run-as identity), serving the same model version. See entry 13 for how prod was done. Rerunning the `deployment` job is not enough: `deploy_model` only runs when training produces a better model.
+
+## 13. Prod monitoring: endpoint recreated as `prod_spn`, dashboard read access for people
+
+- **Problems:**
+  1. The prod endpoint was created before fix 12, so it had no logging, and logging cannot be added to an existing endpoint (entry 12).
+  2. Recreating it with a person's profile would make that person the owner. The prod job (running as `prod_spn`) could then not update it, the logging tables would be owned by the person so the prod monitor job could not read them, and people have no access to the prod model and schema anyway.
+  3. The prod monitoring dashboard showed no data. It runs its queries as the viewer, and people have no read access to prod.
+- **Error:** reading the metrics tables as a person: `[INSUFFICIENT_PERMISSIONS] Insufficient privileges`. As `prod_spn` they held 76 (profile) and 56 (drift) rows.
+- **Fix:**
+  - A temporary CLI profile for `prod_spn` (OAuth client ID and secret in `~/.databrickscfg`, removed afterwards). As `prod_spn`: deleted `marvel-characters-model-serving-prod`, then recreated it serving the same model version (v1) with `telemetry_config`, using the REST request body from `ModelServing`. The endpoint and its `custom_model_otel_*` tables are owned by `prod_spn`, as before.
+  - **Deliberate exception to "no read access to prod":** `prod_spn` granted the workspace user `USE CATALOG` on `mlops_prod`, `USE SCHEMA` on `mlops_prod.marvel_characters`, and `SELECT` on **only** `model_monitoring_profile_metrics` and `model_monitoring_drift_metrics`. These hold per-window statistics (counts, null rates, drift scores), not character rows. `model_monitoring`, `train_set`, `test_set` and the payload tables stay closed. For more people, grant to a named group instead of individual users.
+- **Verified on prod:** a test request was logged in `custom_model_payload` within seconds. The prod monitor job appended only new requests (24, then 46 → 70 rows for 7 requests, no duplicates), created `model_monitoring_baseline` and the monitor, and the dashboard shows the metrics.
 
 ## Local environment notes (Windows)
 
