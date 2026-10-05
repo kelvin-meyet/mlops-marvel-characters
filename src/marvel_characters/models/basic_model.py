@@ -68,9 +68,7 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         X["universe_number"] = X["Universe"].apply(_extract_num)
 
         if self.top_universes_ is not None:
-            X["universe_grouped"] = X["Universe"].apply(
-                lambda u: str(u) if str(u) in self.top_universes_ else "Other"
-            )
+            X["universe_grouped"] = X["Universe"].apply(lambda u: str(u) if str(u) in self.top_universes_ else "Other")
         else:
             X["universe_grouped"] = "Other"
 
@@ -166,20 +164,30 @@ class BasicModel:
         """
         logger.info("🔄 Defining enhanced preprocessing pipeline...")
 
-        numeric_transformer = Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ])
+        numeric_transformer = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]
+        )
 
-        categorical_transformer = Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore", max_categories=30)),
-        ])
+        categorical_transformer = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore", max_categories=30)),
+            ]
+        )
 
         num_features_enh = ["Height", "Weight", "has_height", "has_weight", "universe_number"]
         cat_features_enh = [
-            "universe_grouped", "Identity", "Gender", "Marital_Status",
-            "Teams", "Origin", "Magic", "Mutant",
+            "universe_grouped",
+            "Identity",
+            "Gender",
+            "Marital_Status",
+            "Teams",
+            "Origin",
+            "Magic",
+            "Mutant",
         ]
 
         preprocessor = ColumnTransformer(
@@ -193,12 +201,15 @@ class BasicModel:
             steps=[
                 ("feature_engineer", FeatureEngineer(top_n_universes=20)),
                 ("preprocessor", preprocessor),
-                ("classifier", LGBMClassifier(
-                    class_weight="balanced",
-                    random_state=42,
-                    n_jobs=-1,
-                    verbose=-1,
-                )),
+                (
+                    "classifier",
+                    LGBMClassifier(
+                        class_weight="balanced",
+                        random_state=42,
+                        n_jobs=-1,
+                        verbose=-1,
+                    ),
+                ),
             ]
         )
         logger.info("✅ Enhanced pipeline defined with class_weight='balanced'.")
@@ -407,4 +418,3 @@ class BasicModel:
             version=latest_version,
         )
         return latest_version
-# end of file
