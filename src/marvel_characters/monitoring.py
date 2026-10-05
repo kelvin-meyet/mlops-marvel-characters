@@ -7,60 +7,144 @@ from databricks.sdk.service.catalog import (
     MonitorInferenceLogProblemType,
 )
 from loguru import logger
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import ArrayType, DoubleType, IntegerType, StringType, StructField, StructType
+from pyspark.sql.types import ArrayType, DoubleType, StringType, StructField, StructType
 
 from marvel_characters.config import ProjectConfig
 
+# Value of the monitor's model_id_col, shared by the monitoring and baseline tables
+MODEL_ID = "marvel-characters-model-fe"
+
+# The 10 features of one request record, with the types used in model_monitoring and its baseline
+RECORD_SCHEMA = StructType(
+    [
+        StructField("Height", DoubleType(), True),
+        StructField("Weight", DoubleType(), True),
+        StructField("Universe", StringType(), True),
+        StructField("Identity", StringType(), True),
+        StructField("Gender", StringType(), True),
+        StructField("Marital_Status", StringType(), True),
+        StructField("Teams", StringType(), True),
+        StructField("Origin", StringType(), True),
+        StructField("Magic", StringType(), True),
+        StructField("Mutant", StringType(), True),
+    ]
+)
+
 
 def create_or_refresh_monitoring(config: ProjectConfig, spark: SparkSession, workspace: WorkspaceClient) -> None:
-    """Create or refresh a monitoring table for Marvel character model serving data.
+    """Append new inference requests to model_monitoring and create or refresh its Lakehouse monitor.
 
-    This function processes the inference data from a Delta table,
-    parses the request and response JSON fields, writes the resulting DataFrame to a Delta table for monitoring purposes.
+    Only requests not yet in model_monitoring are appended, so the job can run any number of times.
+    Drift is measured against model_monitoring_baseline, which is rebuilt from train_set on every run.
 
     :param config: Configuration object containing catalog and schema names.
     :param spark: Spark session used for executing SQL queries and transformations.
     :param workspace: Workspace object used for managing quality monitors.
+    :raises ValueError: If the endpoint has not logged any requests yet
     """
-    # Check if custom_model_payload table exists and has data
-    inf_table = spark.sql(f"SELECT * FROM {config.catalog_name}.{config.schema_name}.`custom_model_payload`")
-    inf_count = inf_table.count()
-    logger.info(f"Found {inf_count} records in custom_model_payload table")
+    schema = f"{config.catalog_name}.{config.schema_name}"
+    monitoring_table = f"{schema}.model_monitoring"
+    baseline_table = f"{schema}.model_monitoring_baseline"
 
-    if inf_count == 0:
-        logger.warning("No records found in custom_model_payload table. Monitoring table will be empty.")
+    inf_table = spark.table(f"{schema}.custom_model_payload")
+    if inf_table.isEmpty():
+        raise ValueError(
+            f"No requests in {schema}.custom_model_payload. Send traffic to the serving endpoint, and check that "
+            "it was created with inference-table logging (see ModelServing.telemetry_config)."
+        )
+
+    if spark.catalog.tableExists(monitoring_table):
+        inf_table = select_new_requests(inf_table, spark.table(monitoring_table))
+
+    df_new = parse_inference_table(inf_table)
+    new_count = df_new.count()
+    df_valid = df_new.dropna(subset=["prediction"])
+    valid_count = df_valid.count()
+    if valid_count < new_count:
+        logger.warning(f"Skipping {new_count - valid_count} records without a readable prediction")
+    logger.info(f"New records to append to {monitoring_table}: {valid_count}")
+
+    if valid_count:
+        df_valid.write.format("delta").mode("append").saveAsTable(monitoring_table)
+    elif not spark.catalog.tableExists(monitoring_table):
+        raise ValueError(f"No valid records to create {monitoring_table} from; check the logged responses.")
+
+    build_baseline(spark.table(f"{schema}.train_set"), target=config.target).write.format("delta").mode(
+        "overwrite"
+    ).option("overwriteSchema", "true").saveAsTable(baseline_table)
+
+    try:
+        monitor = workspace.quality_monitors.get(monitoring_table)
+    except NotFound:
+        create_monitoring_table(config=config, spark=spark, workspace=workspace)
         return
 
-    request_schema = StructType(
-        [
-            StructField(
-                "dataframe_records",
-                ArrayType(
-                    StructType(
-                        [
-                            StructField("Height", DoubleType(), True),
-                            StructField("Weight", DoubleType(), True),
-                            StructField("Universe", StringType(), True),
-                            StructField("Identity", StringType(), True),
-                            StructField("Gender", StringType(), True),
-                            StructField("Marital_Status", StringType(), True),
-                            StructField("Teams", StringType(), True),
-                            StructField("Origin", StringType(), True),
-                            StructField("Magic", StringType(), True),
-                            StructField("Mutant", StringType(), True),
-                        ]
-                    )
-                ),
-                True,
-            )
-        ]
+    baseline_added = monitor.baseline_table_name != baseline_table
+    if baseline_added:
+        # Monitors created before the baseline existed: add it (update replaces the whole configuration)
+        workspace.quality_monitors.update(
+            table_name=monitoring_table,
+            output_schema_name=schema,
+            baseline_table_name=baseline_table,
+            inference_log=inference_log_config(),
+        )
+        logger.info(f"Baseline {baseline_table} added to the monitor.")
+
+    if valid_count or baseline_added:
+        workspace.quality_monitors.run_refresh(table_name=monitoring_table)
+        logger.info("Lakehouse monitor refresh started.")
+    else:
+        logger.info("No new records since the last run; monitor not refreshed.")
+
+
+def select_new_requests(inf_table: DataFrame, monitored: DataFrame) -> DataFrame:
+    """Keep only the inference-table rows whose request is not in the monitoring table yet.
+
+    :param inf_table: Rows of the endpoint's inference table
+    :param monitored: The monitoring table (needs databricks_request_id)
+    :return: Inference-table rows with a databricks_request_id not present in monitored
+    """
+    return inf_table.join(monitored.select("databricks_request_id").distinct(), "databricks_request_id", "left_anti")
+
+
+def build_baseline(train_set: DataFrame, target: str) -> DataFrame:
+    """Turn the training data into a drift baseline with the monitoring table's columns and types.
+
+    The monitor requires a prediction column in the baseline. The true label is used for it, so prediction drift
+    compares the served predictions with the alive/dead split the model was trained on.
+
+    :param train_set: The model's training data (the 10 features plus target and ids)
+    :param target: Name of the label column (1 = alive, 0 = dead)
+    :return: DataFrame with the 10 features, cast like model_monitoring, prediction and model_name
+    """
+    return train_set.select(
+        *[F.col(field.name).cast(field.dataType).alias(field.name) for field in RECORD_SCHEMA.fields],
+        F.col(target).cast("int").alias("prediction"),
+        F.lit(MODEL_ID).alias("model_name"),
     )
 
+
+def parse_inference_table(inf_table: DataFrame) -> DataFrame:
+    """Turn raw inference-table rows into one row per scored character.
+
+    Each logged request can hold several records; every record is paired with its own prediction
+    ("alive" -> 1, "dead" -> 0), since the custom model answers {"predictions": {"Survival prediction": [...]}}.
+
+    :param inf_table: Rows of the endpoint's inference table (request/response JSON, request_time, ...)
+    :return: DataFrame with timestamp, request id, the 10 features, prediction and model_name
+    """
+    request_schema = StructType([StructField("dataframe_records", ArrayType(RECORD_SCHEMA), True)])
+
+    # The custom model (MarvelModelWrapper) answers {"predictions": {"Survival prediction": ["alive", "dead", ...]}}
     response_schema = StructType(
         [
-            StructField("predictions", ArrayType(IntegerType()), True),
+            StructField(
+                "predictions",
+                StructType([StructField("Survival prediction", ArrayType(StringType()), True)]),
+                True,
+            ),
             StructField(
                 "databricks_output",
                 StructType(
@@ -75,77 +159,40 @@ def create_or_refresh_monitoring(config: ProjectConfig, spark: SparkSession, wor
 
     inf_table_parsed = inf_table_parsed.withColumn("parsed_response", F.from_json(F.col("response"), response_schema))
 
-    df_exploded = inf_table_parsed.withColumn("record", F.explode(F.col("parsed_request.dataframe_records")))
+    # posexplode keeps each record's position, so every record is matched with its own prediction
+    df_exploded = inf_table_parsed.select(
+        "*", F.posexplode(F.col("parsed_request.dataframe_records")).alias("record_pos", "record")
+    )
+    predicted_label = F.col("parsed_response.predictions.`Survival prediction`").getItem(F.col("record_pos"))
 
     df_final = df_exploded.withColumn("timestamp_ms", (F.col("request_time").cast("long") * 1000)).select(
         F.col("request_time").alias("timestamp"),  # Use request_time as the timestamp
         F.col("timestamp_ms"),  # Select the newly created timestamp_ms column
         "databricks_request_id",
         "execution_duration_ms",
-        F.col("record.Height").alias("Height"),
-        F.col("record.Weight").alias("Weight"),
-        F.col("record.Universe").alias("Universe"),
-        F.col("record.Identity").alias("Identity"),
-        F.col("record.Gender").alias("Gender"),
-        F.col("record.Marital_Status").alias("Marital_Status"),
-        F.col("record.Teams").alias("Teams"),
-        F.col("record.Origin").alias("Origin"),
-        F.col("record.Magic").alias("Magic"),
-        F.col("record.Mutant").alias("Mutant"),
-        F.col("parsed_response.predictions")[0].alias("prediction"),
-        F.lit("marvel-characters-model-fe").alias("model_name"),
+        *[F.col(f"record.{field.name}").alias(field.name) for field in RECORD_SCHEMA.fields],
+        F.when(predicted_label == "alive", 1).when(predicted_label == "dead", 0).alias("prediction"),
+        F.lit(MODEL_ID).alias("model_name"),
     )
+    return df_final
 
-    # Log counts at each step to diagnose where data might be getting filtered out
-    logger.info(f"Records in df_final: {df_final.count()}")
 
-    df_final_with_status = df_final.withColumn("prediction", F.col("prediction").cast("int"))
+def inference_log_config() -> MonitorInferenceLog:
+    """Inference-log settings of the monitor on model_monitoring.
 
-    # Make dropna optional if we're losing all data
-    df_with_valid_values = df_final_with_status.dropna(subset=["prediction"])
-    valid_count = df_with_valid_values.count()
-    logger.info(f"Records with valid prediction values: {valid_count}")
-
-    # If we lost all data after dropna, use the data before dropna
-    if valid_count > 0:
-        df_final_with_status = df_with_valid_values
-        logger.info("Using records with valid prediction values")
-    else:
-        logger.warning("All records have null prediction values. Using records with potential nulls.")
-
-    # Ensure Height and Weight are properly cast to double
-    df_final_with_status = df_final_with_status.withColumn("Height", F.col("Height").cast("double"))
-    df_final_with_status = df_final_with_status.withColumn("Weight", F.col("Weight").cast("double"))
-
-    # Log the final count before writing
-    final_count = df_final_with_status.count()
-    logger.info(f"Final record count before writing to monitoring table: {final_count}")
-
-    # Write to the monitoring table
-    df_final_with_status.write.format("delta").mode("append").saveAsTable(
-        f"{config.catalog_name}.{config.schema_name}.model_monitoring"
+    :return: Classification inference log over prediction, timestamp and model_name, in 5-minute windows
+    """
+    return MonitorInferenceLog(
+        problem_type=MonitorInferenceLogProblemType.PROBLEM_TYPE_CLASSIFICATION,
+        prediction_col="prediction",
+        timestamp_col="timestamp",
+        granularities=["5 minutes"],
+        model_id_col="model_name",
     )
-
-    # Verify data was written
-    written_count = spark.table(f"{config.catalog_name}.{config.schema_name}.model_monitoring").count()
-    logger.info(f"Records in monitoring table after write: {written_count}")
-
-    try:
-        workspace.quality_monitors.get(f"{config.catalog_name}.{config.schema_name}.model_monitoring")
-        workspace.quality_monitors.run_refresh(
-            table_name=f"{config.catalog_name}.{config.schema_name}.model_monitoring"
-        )
-        logger.info("Lakehouse monitoring table exist, refreshing.")
-    except NotFound:
-        create_monitoring_table(config=config, spark=spark, workspace=workspace)
-        logger.info("Lakehouse monitoring table is created.")
 
 
 def create_monitoring_table(config: ProjectConfig, spark: SparkSession, workspace: WorkspaceClient) -> None:
-    """Create a new monitoring table for Marvel character model monitoring.
-
-    This function sets up a monitoring table using the provided configuration,
-    SparkSession, and workspace. It also enables Change Data Feed for the table.
+    """Create the Lakehouse monitor on model_monitoring, with train_set's baseline for drift.
 
     :param config: Configuration object containing catalog and schema names
     :param spark: SparkSession object for executing SQL commands
@@ -153,19 +200,15 @@ def create_monitoring_table(config: ProjectConfig, spark: SparkSession, workspac
     """
     logger.info("Creating new monitoring table..")
 
-    monitoring_table = f"{config.catalog_name}.{config.schema_name}.model_monitoring"
+    schema = f"{config.catalog_name}.{config.schema_name}"
+    monitoring_table = f"{schema}.model_monitoring"
 
     workspace.quality_monitors.create(
         table_name=monitoring_table,
         assets_dir=f"/Workspace/Shared/lakehouse_monitoring/{monitoring_table}",
-        output_schema_name=f"{config.catalog_name}.{config.schema_name}",
-        inference_log=MonitorInferenceLog(
-            problem_type=MonitorInferenceLogProblemType.PROBLEM_TYPE_CLASSIFICATION,
-            prediction_col="prediction",
-            timestamp_col="timestamp",
-            granularities=["30 minutes"],
-            model_id_col="model_name",
-        ),
+        output_schema_name=schema,
+        baseline_table_name=f"{schema}.model_monitoring_baseline",
+        inference_log=inference_log_config(),
     )
 
     # Important to update monitoring

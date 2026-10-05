@@ -15,6 +15,7 @@ from delta.tables import DeltaTable
 from lightgbm import LGBMClassifier
 from loguru import logger
 from mlflow import MlflowClient
+from mlflow.exceptions import MlflowException
 from mlflow.models import infer_signature
 from pyspark.sql import SparkSession
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -352,10 +353,17 @@ class BasicModel:
 
         Compares the current model with the latest registered model using F1-macro.
         Falls back to f1_score for backward compatibility with older models.
-        :return: True if the current model performs better, False otherwise.
+        :return: True if the current model performs better (or no model is registered yet), False otherwise.
         """
         client = MlflowClient()
-        latest_model_version = client.get_model_version_by_alias(name=self.model_name, alias="latest-model")
+        try:
+            latest_model_version = client.get_model_version_by_alias(name=self.model_name, alias="latest-model")
+        except MlflowException as e:
+            # First run in a fresh environment (e.g. stage/prod): nothing registered yet, so nothing to beat.
+            if e.error_code == "RESOURCE_DOES_NOT_EXIST":
+                logger.info(f"No '{self.model_name}@latest-model' registered yet. Treating current model as improved.")
+                return True
+            raise
         latest_model_uri = f"models:/{latest_model_version.model_id}"
 
         result = mlflow.models.evaluate(
