@@ -1,5 +1,6 @@
 # Databricks notebook source
 # %pip install marvel_characters-0.1.0-py3-none-any.whl
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -25,6 +26,7 @@ test_set = spark.table(f"{config.catalog_name}.{config.schema_name}.test_set") \
                         .toPandas()
 
 # COMMAND ----------
+
 if is_databricks():
     from pyspark.dbutils import DBUtils
     dbutils = DBUtils(spark)
@@ -37,6 +39,7 @@ else:
     assert os.environ.get("DBR_TOKEN"), "DBR_TOKEN must be set in your environment or .env file."
     assert os.environ.get("DBR_HOST"), "DBR_HOST must be set in your environment or .env file."
     profile = os.environ["PROFILE"]
+
 # COMMAND ----------
 
 from databricks.sdk import WorkspaceClient

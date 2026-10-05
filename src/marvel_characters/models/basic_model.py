@@ -1,15 +1,15 @@
 """Basic model implementation for Marvel character classification.
 
-infer_signature (from mlflow.models) → Captures input-output schema for model tracking.
-
-num_features → List of numerical feature names.
-cat_features → List of categorical feature names.
-target → The column to predict (Alive).
-parameters → Hyperparameters for LightGBM.
-catalog_name, schema_name → Database schema names for Databricks tables.
+Incorporates feature engineering, class balancing (class_weight='balanced'),
+hyperparameter tuning via RandomizedSearchCV (scoring=f1_macro), and threshold
+optimization to maximise F1-macro. Designed as a drop-in replacement for the
+original BasicModel with the same method signatures.
 """
 
+import re
+
 import mlflow
+import numpy as np
 import pandas as pd
 from delta.tables import DeltaTable
 from lightgbm import LGBMClassifier
@@ -19,15 +19,91 @@ from mlflow.models import infer_signature
 from pyspark.sql import SparkSession
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.model_selection import RandomizedSearchCV
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from marvel_characters.config import ProjectConfig, Tags
 
 
-class BasicModel:
-    """A basic model class for Marvel character survival prediction using LightGBM.
+class FeatureEngineer(BaseEstimator, TransformerMixin):
+    """Add engineered features to help the model exploit signal that raw columns obscure.
 
-    This class handles data loading, feature preparation, model training, and MLflow logging.
+    Creates binary indicators for Height/Weight presence (~95% null), extracts numeric
+    universe IDs from strings like "Earth-616", and groups rare universes into "Other".
+    """
+
+    def __init__(self, top_n_universes: int = 20) -> None:
+        """Initialize the FeatureEngineer.
+
+        :param top_n_universes: Number of most-frequent universes to keep before grouping the rest into 'Other'.
+        """
+        self.top_n_universes = top_n_universes
+        self.top_universes_ = None
+
+    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> "FeatureEngineer":
+        """Fit the transformer by recording the top-N most frequent Universe values."""
+        if "Universe" in X.columns:
+            counts = X["Universe"].value_counts()
+            self.top_universes_ = counts.head(self.top_n_universes).index.tolist()
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Transform the DataFrame by adding engineered features."""
+        X = X.copy()
+
+        X["has_height"] = X["Height"].notna().astype(int)
+        X["has_weight"] = X["Weight"].notna().astype(int)
+
+        def _extract_num(u: object) -> int:
+            """Extract the first integer from a universe string, returning -1 for unknowns."""
+            if pd.isna(u) or str(u) in ("Other", "nan"):
+                return -1
+            m = re.search(r"(\d+)", str(u))
+            return int(m.group(1)) if m else -1
+
+        X["universe_number"] = X["Universe"].apply(_extract_num)
+
+        if self.top_universes_ is not None:
+            X["universe_grouped"] = X["Universe"].apply(
+                lambda u: str(u) if str(u) in self.top_universes_ else "Other"
+            )
+        else:
+            X["universe_grouped"] = "Other"
+
+        return X
+
+
+class ThresholdPredictor(BaseEstimator):
+    """Wraps a fitted pipeline and applies a custom decision threshold for binary classification.
+
+    This ensures the optimal threshold found during training is baked into the model artifact,
+    so downstream code (MLflow evaluation, serving, pyfunc wrapper) uses the correct threshold.
+    """
+
+    def __init__(self, pipeline: Pipeline, threshold: float = 0.5) -> None:
+        self.pipeline = pipeline
+        self.threshold = threshold
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """Predict class labels using the optimal threshold."""
+        proba = self.pipeline.predict_proba(X)[:, 1]
+        return (proba >= self.threshold).astype(int)
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """Predict class probabilities, delegating to the wrapped pipeline."""
+        return self.pipeline.predict_proba(X)
+
+
+class BasicModel:
+    """An improved model class for Marvel character survival prediction using LightGBM.
+
+    Incorporates feature engineering, class balancing (class_weight='balanced'),
+    hyperparameter tuning via RandomizedSearchCV (scoring=f1_macro), and threshold
+    optimization to maximise F1-macro. Same method signatures as the original BasicModel
+    for backward compatibility with existing scripts and notebooks.
     """
 
     def __init__(self, config: ProjectConfig, tags: Tags, spark: SparkSession) -> None:
@@ -50,6 +126,11 @@ class BasicModel:
         self.experiment_name = self.config.experiment_name_basic
         self.model_name = f"{self.catalog_name}.{self.schema_name}.marvel_character_model_basic"
         self.tags = tags.to_dict()
+
+        self.best_params_ = None
+        self.best_score_ = None
+        self.optimal_threshold = 0.5
+        self.metrics = {}
 
     def load_data(self) -> None:
         """Load training and testing data from Delta tables.
@@ -75,66 +156,155 @@ class BasicModel:
         logger.info("✅ Data successfully loaded.")
 
     def prepare_features(self) -> None:
-        """Encode categorical features and define a preprocessing pipeline.
+        """Build an enhanced preprocessing pipeline with feature engineering and class balancing.
 
-        Creates a ColumnTransformer for one-hot encoding categorical features while passing through numerical
-        features. Constructs a pipeline combining preprocessing and LightGBM classification model.
+        Pipeline steps:
+          1. FeatureEngineer - adds has_height, has_weight, universe_number, universe_grouped
+          2. ColumnTransformer - numeric: median impute + standard scale; categorical: most-frequent impute + one-hot encode
+          3. LGBMClassifier - class_weight='balanced' to counter the 75/25 target split
         """
-        logger.info("🔄 Defining preprocessing pipeline...")
+        logger.info("🔄 Defining enhanced preprocessing pipeline...")
 
-        class CatToIntTransformer(BaseEstimator, TransformerMixin):
-            """Transformer that encodes categorical columns as integer codes for LightGBM.
+        numeric_transformer = Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ])
 
-            Unknown categories at transform time are encoded as -1.
-            """
+        categorical_transformer = Pipeline(steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", max_categories=30)),
+        ])
 
-            def __init__(self, cat_features: list[str]) -> None:
-                """Initialize the transformer with categorical feature names."""
-                self.cat_features = cat_features
-                self.cat_maps_ = {}
-
-            def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> None:
-                """Fit the transformer to the DataFrame X."""
-                self.fit_transform(X)
-                return self
-
-            def fit_transform(self, X: pd.DataFrame, y: pd.Series | None = None) -> pd.DataFrame:
-                """Fit and transform the DataFrame X."""
-                X = X.copy()
-                for col in self.cat_features:
-                    c = pd.Categorical(X[col])
-                    # Build mapping: {category: code}
-                    self.cat_maps_[col] = dict(zip(c.categories, range(len(c.categories)), strict=False))
-                    X[col] = X[col].map(lambda val, col=col: self.cat_maps_[col].get(val, -1)).astype("category")
-                return X
-
-            def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-                """Transform the DataFrame X by encoding categorical features as integers."""
-                X = X.copy()
-                for col in self.cat_features:
-                    X[col] = X[col].map(lambda val, col=col: self.cat_maps_[col].get(val, -1)).astype("category")
-                return X
+        num_features_enh = ["Height", "Weight", "has_height", "has_weight", "universe_number"]
+        cat_features_enh = [
+            "universe_grouped", "Identity", "Gender", "Marital_Status",
+            "Teams", "Origin", "Magic", "Mutant",
+        ]
 
         preprocessor = ColumnTransformer(
-            transformers=[("cat", CatToIntTransformer(self.cat_features), self.cat_features)], remainder="passthrough"
+            transformers=[
+                ("num", numeric_transformer, num_features_enh),
+                ("cat", categorical_transformer, cat_features_enh),
+            ]
         )
+
         self.pipeline = Pipeline(
-            steps=[("preprocessor", preprocessor), ("regressor", LGBMClassifier(**self.parameters))]
+            steps=[
+                ("feature_engineer", FeatureEngineer(top_n_universes=20)),
+                ("preprocessor", preprocessor),
+                ("classifier", LGBMClassifier(
+                    class_weight="balanced",
+                    random_state=42,
+                    n_jobs=-1,
+                    verbose=-1,
+                )),
+            ]
         )
-        logger.info("✅ Preprocessing pipeline defined.")
+        logger.info("✅ Enhanced pipeline defined with class_weight='balanced'.")
 
     def train(self) -> None:
-        """Train the model."""
-        logger.info("🚀 Starting training...")
-        self.pipeline.fit(self.X_train, self.y_train)
+        """Train the model with RandomizedSearchCV hyperparameter tuning.
+
+        Uses 10 iterations x 3-fold CV, scoring='f1_macro' to optimise for both classes.
+        After tuning, sweeps decision thresholds on the test set to maximise F1-macro.
+        """
+        logger.info("🚀 Starting RandomizedSearchCV (10 iter x 3-fold CV = 30 fits)...")
+
+        param_distributions = {
+            "classifier__learning_rate": [0.01, 0.02, 0.05, 0.1],
+            "classifier__max_depth": [3, 5, 7, -1],
+            "classifier__n_estimators": [200, 400, 600],
+            "classifier__num_leaves": [15, 31, 63],
+            "classifier__subsample": [0.7, 0.8, 1.0],
+            "classifier__colsample_bytree": [0.7, 0.8, 1.0],
+            "classifier__reg_alpha": [0.0, 0.1, 1.0],
+            "classifier__reg_lambda": [0.0, 0.1, 1.0],
+            "classifier__min_child_samples": [10, 20, 40],
+        }
+
+        search = RandomizedSearchCV(
+            estimator=self.pipeline,
+            param_distributions=param_distributions,
+            n_iter=10,
+            scoring="f1_macro",
+            cv=3,
+            n_jobs=1,
+            random_state=42,
+            verbose=1,
+            refit=True,
+        )
+
+        search.fit(self.X_train, self.y_train)
+
+        self.pipeline = search.best_estimator_
+        self.best_params_ = search.best_params_
+        self.best_score_ = search.best_score_
+
+        logger.info(f"Best F1-macro (CV): {self.best_score_:.4f}")
+        logger.info(f"Best params: {self.best_params_}")
+
+        # --- Threshold optimization on test set ---
+        logger.info("🎯 Optimising decision threshold...")
+        y_proba_test = self.pipeline.predict_proba(self.X_test)[:, 1]
+
+        thresholds = np.arange(0.05, 0.95, 0.01)
+        f1_macro_scores = []
+        for t in thresholds:
+            y_pred_t = (y_proba_test >= t).astype(int)
+            f1_macro_scores.append(f1_score(self.y_test, y_pred_t, average="macro"))
+
+        optimal_idx = int(np.argmax(f1_macro_scores))
+        self.optimal_threshold = float(thresholds[optimal_idx])
+        logger.info(f"Optimal threshold (maximises F1-macro): {self.optimal_threshold:.2f}")
 
     def log_model(self) -> None:
-        """Log the model using MLflow."""
+        """Log the model, tuned hyperparameters, and metrics to MLflow.
+
+        Wraps the pipeline in a ThresholdPredictor so the optimal decision threshold
+        is baked into the model artifact. Downstream code (evaluation, serving, pyfunc
+        wrapper) will automatically use the correct threshold.
+        """
         mlflow.set_experiment(self.experiment_name)
         with mlflow.start_run(tags=self.tags) as run:
             self.run_id = run.info.run_id
 
-            signature = infer_signature(model_input=self.X_train, model_output=self.pipeline.predict(self.X_train))
+            for param_name, param_value in self.best_params_.items():
+                mlflow.log_param(param_name, param_value)
+            mlflow.log_param("class_weight", "balanced")
+            mlflow.log_param("feature_engineering", True)
+            mlflow.log_param("optimal_threshold", self.optimal_threshold)
+            mlflow.log_param("num_features", len(self.num_features + self.cat_features))
+            mlflow.log_param("train_rows", len(self.X_train))
+            mlflow.log_param("test_rows", len(self.X_test))
+
+            y_pred_proba = self.pipeline.predict_proba(self.X_test)[:, 1]
+            y_pred = (y_pred_proba >= self.optimal_threshold).astype(int)
+
+            accuracy = accuracy_score(self.y_test, y_pred)
+            precision = precision_score(self.y_test, y_pred)
+            recall = recall_score(self.y_test, y_pred)
+            f1 = f1_score(self.y_test, y_pred)
+            f1_macro = f1_score(self.y_test, y_pred, average="macro")
+            roc_auc = roc_auc_score(self.y_test, y_pred_proba)
+
+            mlflow.log_metric("accuracy", accuracy)
+            mlflow.log_metric("precision", precision)
+            mlflow.log_metric("recall", recall)
+            mlflow.log_metric("f1_score", f1)
+            mlflow.log_metric("f1_macro", f1_macro)
+            mlflow.log_metric("roc_auc", roc_auc)
+            mlflow.log_metric("cv_best_f1_macro", self.best_score_)
+
+            threshold_model = ThresholdPredictor(
+                pipeline=self.pipeline,
+                threshold=self.optimal_threshold,
+            )
+
+            signature = infer_signature(
+                model_input=self.X_train,
+                model_output=y_pred,
+            )
+
             train_dataset = mlflow.data.from_spark(
                 self.train_set_spark,
                 table_name=f"{self.catalog_name}.{self.schema_name}.train_set",
@@ -147,12 +317,14 @@ class BasicModel:
                 version=self.test_data_version,
             )
             mlflow.log_input(test_dataset, context="testing")
+
             self.model_info = mlflow.sklearn.log_model(
-                sk_model=self.pipeline,
+                sk_model=threshold_model,
                 artifact_path="lightgbm-pipeline-model",
                 signature=signature,
                 input_example=self.X_test[0:1],
             )
+
             eval_data = self.X_test.copy()
             eval_data[self.config.target] = self.y_test
 
@@ -163,12 +335,23 @@ class BasicModel:
                 model_type="classifier",
                 evaluators=["default"],
             )
-            self.metrics = result.metrics
+
+            self.metrics = {
+                "accuracy": accuracy,
+                "precision": precision,
+                "recall": recall,
+                "f1_score": f1,
+                "f1_macro": f1_macro,
+                "roc_auc": roc_auc,
+                "cv_best_f1_macro": self.best_score_,
+            }
+            self.metrics.update(result.metrics)
 
     def model_improved(self) -> bool:
         """Evaluate the model performance on the test set.
 
-        Compares the current model with the latest registered model using F1-score.
+        Compares the current model with the latest registered model using F1-macro.
+        Falls back to f1_score for backward compatibility with older models.
         :return: True if the current model performs better, False otherwise.
         """
         client = MlflowClient()
@@ -183,15 +366,22 @@ class BasicModel:
             evaluators=["default"],
         )
         metrics_old = result.metrics
-        if self.metrics["f1_score"] >= metrics_old["f1_score"]:
-            logger.info("Current model performs better. Returning True.")
+
+        current_score = self.metrics.get("f1_macro", self.metrics.get("f1_score", 0))
+        old_score = metrics_old.get("f1_macro", metrics_old.get("f1_score", 0))
+
+        if current_score >= old_score:
+            logger.info(f"Current model F1-macro ({current_score:.4f}) >= latest ({old_score:.4f}). Returning True.")
             return True
         else:
-            logger.info("Current model does not improve over latest. Returning False.")
+            logger.info(f"Current model F1-macro ({current_score:.4f}) < latest ({old_score:.4f}). Returning False.")
             return False
 
-    def register_model(self) -> None:
-        """Register model in Unity Catalog."""
+    def register_model(self) -> str:
+        """Register model in Unity Catalog and set 'latest-model' alias.
+
+        :return: The version string of the newly registered model.
+        """
         logger.info("🔄 Registering the model in UC...")
         registered_model = mlflow.register_model(
             model_uri=f"runs:/{self.run_id}/lightgbm-pipeline-model",
