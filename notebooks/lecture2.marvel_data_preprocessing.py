@@ -1,14 +1,15 @@
 # Databricks notebook source
-
 # MAGIC %pip install -e ..
 # MAGIC %restart_python
 
 # COMMAND ----------
-# from pathlib import Path
-# import sys
-# sys.path.append(str(Path.cwd().parent / 'src'))
+
+from pathlib import Path
+import sys
+sys.path.append(str(Path.cwd().parent / 'src'))
 
 # COMMAND ----------
+
 import pandas as pd
 import yaml
 from loguru import logger
@@ -39,6 +40,7 @@ logger.info(f"Target column '{config.target}' distribution:")
 logger.info(df[config.target].value_counts())
 
 # COMMAND ----------
+
 # Load the Marvel characters dataset
 
 data_processor = DataProcessor(df, config, spark)
@@ -56,6 +58,7 @@ logger.info(f"Training set shape: {X_train.shape}")
 logger.info(f"Test set shape: {X_test.shape}")
 
 # COMMAND ----------
+
 # Save to catalog
 logger.info("Saving data to catalog")
 data_processor.save_to_catalog(X_train, X_test)
@@ -63,4 +66,3 @@ data_processor.save_to_catalog(X_train, X_test)
 # Enable change data feed (only once!)
 logger.info("Enable change data feed")
 data_processor.enable_change_data_feed()
-# COMMAND ---------- 
